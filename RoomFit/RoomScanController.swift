@@ -91,6 +91,10 @@ enum RoomFitFurnitureType: String, CaseIterable {
 
     static let floatingThreshold = 0.3
 
+    static func looksLikeHanger(height: Double, depth: Double) -> Bool {
+        (1.3...2.0).contains(height) && depth >= 0.45
+    }
+
     /// RoomPlan은 소형 냉장고를 자주 .storage로 잡는다. 서랍장·책장보다 깊고 평면이 정사각형에
     /// 가까운 게 특징이라, 주방 근처에 있을 때만 이 모양을 냉장고로 본다.
     static func looksLikeRefrigerator(height: Double, width: Double, depth: Double) -> Bool {
@@ -135,7 +139,8 @@ enum RoomFitFurnitureType: String, CaseIterable {
         footprintWidth: Double = 0,
         underCountertopAppliance: Bool = false,
         nearKitchen: Bool = false,
-        chairTuckedUnder: Bool = false
+        chairTuckedUnder: Bool = false,
+        openShelf: Bool? = nil
     ) -> RoomFitFurnitureType? {
         switch category {
         case .bed: return .bed
@@ -154,6 +159,10 @@ enum RoomFitFurnitureType: String, CaseIterable {
             if nearKitchen && looksLikeRefrigerator(height: height, width: footprintWidth, depth: footprintDepth) {
                 return .refrigerator
             }
+            // 행거: RoomPlan에 행거 카테고리는 없지만 iOS 17부터 수납장을 문 달린 장(cabinet)과
+            // 오픈 선반(shelf)으로 구분해 준다. 문 없이 열린 구조이면서 키가 크고, 책장(보통 깊이
+            // 0.45m 미만)보다 깊으면 옷이 걸린 행거로 본다.
+            if openShelf == true && looksLikeHanger(height: height, depth: footprintDepth) { return .hanger }
             if height > 1.6 && footprintDepth > 0.5 { return .wardrobe }
             if footprintDepth < 0.45 || height > 1.2 { return .bookshelf }
             return .drawerChest
@@ -1330,6 +1339,8 @@ final class RoomScanController: NSObject, ObservableObject {
             let corner: (x: Double, z: Double)
             let rotation: Double
             let footprint: (width: Double, depth: Double)
+            /// iOS 17+ RoomPlan StorageType: true = 오픈 선반(shelf), false = 문 달린 장(cabinet), nil = 정보 없음.
+            let openShelf: Bool?
         }
         let scanned = capturedRoom.objects.map { object -> ScannedObject in
             let height = Double(abs(object.dimensions.y))
@@ -1351,7 +1362,8 @@ final class RoomScanController: NSObject, ObservableObject {
                     rawWidth: Double(object.dimensions.x),
                     rawDepth: Double(object.dimensions.z),
                     rotationDegrees: rotation
-                )
+                ),
+                openShelf: storageIsOpenShelf(object)
             )
         }
         let countertopAppliances = scanned.filter {
@@ -1386,7 +1398,8 @@ final class RoomScanController: NSObject, ObservableObject {
                 nearKitchen: object.category == .storage && item.elevation < RoomFitFurnitureType.floatingThreshold
                     && kitchenAnchors.contains { $0.object.identifier != object.identifier && planGap($0, item) <= 1.2 },
                 chairTuckedUnder: object.category == .storage && item.elevation < RoomFitFurnitureType.floatingThreshold
-                    && scanned.contains { $0.object.category == .chair && overlapsInPlan($0, item) }
+                    && scanned.contains { $0.object.category == .chair && overlapsInPlan($0, item) },
+                openShelf: item.openShelf
             ) else {
                 logDebug("[RoomFit] skipped unsupported RoomPlan category \(object.category)")
                 return nil
@@ -1396,6 +1409,15 @@ final class RoomScanController: NSObject, ObservableObject {
             let rotation = item.rotation
             let footprint = item.footprint
             let floating = type.isFloating(elevation: elevation)
+            if object.category == .storage {
+                // 수납장 세분화 기준(행거·책장·옷장 등)을 실제 스캔으로 다듬을 수 있게 남긴다.
+                let storageKind = item.openShelf.map { $0 ? "shelf" : "cabinet" } ?? "unknown"
+                logDebug(
+                    "[RoomFit] storage \(object.identifier.uuidString.prefix(8)) -> \(type.rawValue) "
+                        + "(w \(roundedOffset(item.footprint.width)) d \(roundedOffset(footprintDepth)) "
+                        + "h \(roundedOffset(height)) elev \(roundedOffset(elevation)) kind \(storageKind))"
+                )
+            }
             let roundedWidth = roundedOffset(footprint.width)
             let roundedDepth = roundedOffset(footprint.depth)
             let clampedPosition = clampFootprintCenter(
@@ -1495,6 +1517,16 @@ final class RoomScanController: NSObject, ObservableObject {
 
     private func sortedDimensions(from dimensions: simd_float3) -> [Double] {
         [Double(abs(dimensions.x)), Double(abs(dimensions.y)), Double(abs(dimensions.z))].sorted()
+    }
+
+    /// iOS 17+에서만 RoomPlan이 수납장 종류(문 달린 장/오픈 선반)를 알려준다.
+    private func storageIsOpenShelf(_ object: CapturedRoom.Object) -> Bool? {
+        guard object.category == .storage else { return nil }
+        if #available(iOS 17.0, *) {
+            guard let storageType = object.attribute(of: StorageType.self) else { return nil }
+            return storageType == .shelf
+        }
+        return nil
     }
 
     private func roundedOffset(_ value: Double) -> Double {
